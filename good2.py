@@ -245,24 +245,21 @@ class Server:
     def onConsensusReplyReceived(self, res):
         messageID = res['reply-to']
         value = res['value']
-
+        
         # Store the received value
-        if messageID in self.pending_consensus:
-            self.pending_consensus[messageID].append(value)
-
-            # Check if all responses are received or timeout occurred
-            if (len(self.pending_consensus[messageID]) == len(self.peers) - 2 or
-                    time.time() - self.pending_consensus_start_time[messageID] > 10):
-                consensus_value = max(set(self.pending_consensus[messageID]), key=self.pending_consensus[messageID].count)
-                print(f"Consensus for message ID {messageID} is {consensus_value}")
-
-                # Optionally, update the word list if this node was the initiator
-                # self.words[index] = consensus_value
-
-                # Clean up the stored responses
-                del self.pending_consensus[messageID]
-                del self.pending_consensus_start_time[messageID]
-
+        self.pending_consensus[messageID].append(value)
+        
+        # Check if all responses are received
+        if len(self.pending_consensus[messageID]) == len(self.peers) - 1:
+            consensus_value = max(set(self.pending_consensus[messageID]), key=self.pending_consensus[messageID].count)
+            print(f"Consensus for message ID {messageID} is {consensus_value}")
+            
+            # Optionally, update the word list if this node was the initiator
+            # You need to track if this node initiated the consensus to do the update
+            # self.words[index] = consensus_value
+            
+            # Clean up the stored responses
+            del self.pending_consensus[messageID]
     
     def initiateConsensus(self, index, OM_level=0, value=None, peers=None, messageID=None, due=None):
         if peers is None:
@@ -288,10 +285,20 @@ class Server:
             peer_host, peer_port = peer.split(':')
             self.sendUDPCommand(command, peer_host, int(peer_port))
 
-        # Track the message ID and start time
-        self.pending_consensus[messageID] = []
-        self.pending_consensus_start_time[messageID] = time.time()
-        return messageID
+        responses = []
+        start_time = time.time()
+        while time.time() - start_time < 30:
+            try:
+                data, addr = self.peerSocket.recvfrom(1024)
+                res = json.loads(data.decode('utf-8', 'ignore'))
+                if res['reply-to'] == messageID:
+                    responses.append(res['value'])
+            except socket.timeout:
+                continue
+        
+        consensus_value = max(set(responses), key=responses.count)
+        self.words[index] = consensus_value
+        return consensus_value
 
     def sendUDPCommand(self, command, host, port):
         print(f"Sending UDP command to {host}:{port} with command {command}")
@@ -306,8 +313,8 @@ class Server:
             conn.sendall((json.dumps(self.words, indent=2) + '\n').encode())
         elif command[0] == 'consensus' and len(command) > 1:
             index = int(command[1])
-            messageID = self.initiateConsensus(index)
-            conn.sendall((f"Consensus on index {index} initiated with message ID {messageID}.\n").encode())
+            self.initiateConsensus(index)
+            conn.sendall((f"Consensus on index {index} completed.\n").encode())
         elif command[0] == 'lie':
             self.is_lying = True
             if len(command) > 1:
