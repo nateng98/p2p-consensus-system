@@ -46,11 +46,15 @@ class Server:
         self.client_sockets = []
         self.debug = debug
         self.pending_consensus = defaultdict(list)
+        self.pending_consensus_start_time = {}
 
-        self.host = None
+        self.host = self.get_ip_address()
         self.clientPort = 15000 if specified_port == 16000 else None
         self.peerPort = 16000 if specified_port == 16000 else None
         self.gossipsReceived = []
+
+    def get_ip_address(self):
+        return socket.gethostbyname(socket.gethostname())
 
     def addWellKnownHosts(self):
         for host in WELL_KNOWN_HOSTS:
@@ -68,7 +72,6 @@ class Server:
         return clientSocket, peerSocket
     
     def setServerInfo(self, clientSocket, peerSocket):
-        self.host = socket.gethostname()
         self.clientPort = clientSocket.getsockname()[1]
         self.peerPort = peerSocket.getsockname()[1]
     
@@ -167,11 +170,14 @@ class Server:
                     "command": 'GOSSIP',
                     "host": self.host,
                     "port": self.peerPort,
-                    "name": 'Me',
+                    "name": 'Loser',
                     "messageID": str(uuid.uuid4())
                 }
                 self.peerSocket.sendto(json.dumps(gossip).encode(), (p.host, p.port))
             self.events[event.id].renew(time.time() + 60)
+        elif event.name == 'consensus':
+            index = event.index
+            self.initiateConsensus(index)
     
     def generatePeerKey(self, res):
         return res['host'] + ':' + str(res['port'])
@@ -200,9 +206,9 @@ class Server:
                 
                 reply = {
                     'command': 'GOSSIP_REPLY',
-                    'host': socket.gethostname(),
+                    'host': self.host,
                     'port': port,
-                    'name': 'Me reply',
+                    'name': 'Loser replies',
                 }
                 peerSocket.sendto(json.dumps(reply).encode(), (peer.host, peer.port))
                 
@@ -255,6 +261,15 @@ class Server:
                     time.time() - self.pending_consensus_start_time[messageID] > 10):
                 consensus_value = max(set(self.pending_consensus[messageID]), key=self.pending_consensus[messageID].count)
                 print(f"Consensus for message ID {messageID} is {consensus_value}")
+                
+                consensus_notification = {
+                'command': 'CONSENSUS-REPLY',
+                'value': consensus_value,
+                'messageID': messageID
+            }
+
+            for peer in self.peers.values():
+                self.sendUDPCommand(consensus_notification, peer.host, peer.port)
 
                 # Optionally, update the word list if this node was the initiator
                 # self.words[index] = consensus_value
@@ -274,6 +289,8 @@ class Server:
         if due is None:
             due = int(time.time()) + 30
 
+        print(f"Initiating consensus on index {index} with value {value} at OM level {OM_level}")
+
         command = {
             'command': 'CONSENSUS',
             'OM': OM_level,
@@ -286,6 +303,7 @@ class Server:
 
         for peer in peers:
             peer_host, peer_port = peer.split(':')
+            print(f"Sending CONSENSUS command to peer {peer_host}:{peer_port}")
             self.sendUDPCommand(command, peer_host, int(peer_port))
 
         # Track the message ID and start time
@@ -306,7 +324,9 @@ class Server:
             conn.sendall((json.dumps(self.words, indent=2) + '\n').encode())
         elif command[0] == 'consensus' and len(command) > 1:
             index = int(command[1])
+            print(f"CLI command: Initiating consensus on index {index}")
             messageID = self.initiateConsensus(index)
+            print(f"Consensus initiated with message ID {messageID}")
             conn.sendall((f"Consensus on index {index} initiated with message ID {messageID}.\n").encode())
         elif command[0] == 'lie':
             self.is_lying = True
