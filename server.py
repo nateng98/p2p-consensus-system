@@ -5,6 +5,7 @@ import socket
 import time
 import random
 import uuid
+from collections import defaultdict
 
 WELL_KNOWN_HOSTS = [
     'owl.cs.umanitoba.ca',
@@ -14,7 +15,6 @@ WELL_KNOWN_HOSTS = [
 ]
 
 class Event:
-    
     def __init__(self, id, name, expiry):
         self.id = id
         self.name = name
@@ -24,7 +24,6 @@ class Event:
         self.expiry = expiry
 
 class Peer:
-    
     def __init__(self, host, port, name):
         self.host = host
         self.port = port
@@ -33,28 +32,31 @@ class Peer:
     
     def renew(self):
         self.expiry = time.time() + 120
-        
-    def info(self):
-        print(self.host, self.port, self.name)
 
 class Server:
-    
-    def __init__(self, specified_port=None):
-        self.counter = 0 # Debug counter for gossip IDs appended
-        self.gossipsReceived = []
+    def __init__(self, specified_port=None, debug=False):
         self.peers = {}
         self.addWellKnownHosts()
-        self.words = ['', '', '', '', '']
+        self.words = self.generate_random_words(5)
         self.events = {}
         e = Event(str(uuid.uuid4()), 'gossip', time.time() + 60)
         self.events[e.id] = e
         self.is_lying = False
+        self.lie_probability = 0.0  # between 0 and 1
         self.client_sockets = []
+        self.debug = debug
+        self.pending_consensus = defaultdict(list)
+        self.pending_consensus_start_time = {}
+        self.pending_consensus_peers = defaultdict(set)
 
-        # Create a class for this
-        self.host = None
+        self.host = self.get_ip_address()
+        self.hostname = socket.gethostname()
         self.clientPort = 15000 if specified_port == 16000 else None
         self.peerPort = 16000 if specified_port == 16000 else None
+        self.gossipsReceived = []
+
+    def get_ip_address(self):
+        return socket.gethostbyname(socket.gethostname())
 
     def addWellKnownHosts(self):
         for host in WELL_KNOWN_HOSTS:
@@ -69,16 +71,15 @@ class Server:
         clientSocket.listen(5)
         self.setServerInfo(clientSocket, peerSocket)
         self.logSocketsInfo()
-        return (clientSocket, peerSocket)
+        return clientSocket, peerSocket
     
     def setServerInfo(self, clientSocket, peerSocket):
-        self.host = socket.gethostname()
         self.clientPort = clientSocket.getsockname()[1]
         self.peerPort = peerSocket.getsockname()[1]
     
     def logSocketsInfo(self):
-        print(f"Client | TCP | Port {self.clientPort} | Host {self.host}")
-        print(f"Peer   | UDP | Port {self.peerPort} | Host {self.host}")
+        print(f"Client | TCP | Host {self.host} | {self.hostname} | Port {self.clientPort}")
+        print(f"Peer   | UDP | Host {self.host} | {self.hostname} | Port {self.peerPort}")
          
     def configSocket(self, s, port=None):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -92,19 +93,22 @@ class Server:
         return Peer(gossip['host'], gossip['port'], gossip['name'])
     
     def nextEvent(self):
-        return min(self.events.values(), key = lambda e: e.expiry)
+        return min(self.events.values(), key=lambda e: e.expiry)
     
     def clearExpiredPeers(self):
-        keys = []
-        for key, value in self.peers.items():
-            if value.expiry < int(time.time()):
-                keys.append(key)
+        keys = [key for key, value in self.peers.items() if value.expiry < time.time()]
         for key in keys:
             del self.peers[key]
-            print(f'Cleared peer {key}')
+            if self.debug:
+                print(f'Cleared peer {key}')
+
+    def generate_random_words(self, n):
+        predefined_words = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape", "honeydew", "kiwi", "lemon"]
+        return random.sample(predefined_words, n)
 
     def start(self):
         clientSocket, peerSocket = self.createSockets()
+        self.peerSocket = peerSocket  # Store peerSocket as an instance variable
         inputs = [clientSocket, peerSocket]
         
         with clientSocket, peerSocket:
@@ -113,7 +117,7 @@ class Server:
                     event = self.nextEvent()
                     timeout = event.expiry - time.time()
                             
-                    readable, writable, exceptional = select.select(
+                    readable, _, exceptional = select.select(
                         inputs + self.client_sockets,
                         [],
                         inputs + self.client_sockets,
@@ -121,66 +125,73 @@ class Server:
                     
                     for r in readable:
                         if r is peerSocket:
-                            data, addr = r.recvfrom(1024)
-                            res = json.loads(data.decode('utf-8', 'ignore'))
-                            command = res['command']
-                            if command == 'GOSSIP':
-                                self.onGossiped(int(peerSocket.getsockname()[1]), r, res)
-                            elif command == 'GOSSIP_REPLY':
-                                self.onGossipReplied(res)
-                            elif command == 'CONSENSUS':
-                                self.onConsensusReceived(r, res)
+                            self.handlePeerSocket(r)
                         elif r is clientSocket:
-                            conn, addr = r.accept()
-                            conn.setblocking(False)
-                            self.client_sockets.append(conn)
+                            self.handleClientSocket(r)
                         elif r in self.client_sockets:
-                            data = r.recv(1024)
-                            if not data:
-                                self.client_sockets.remove(r)
-                            else:
-                                self.handleCLI(r, data)
+                            self.handleClientData(r)
                     
                     self.clearExpiredPeers()
+                    self.handleEvent(event)
                     
-                    if event.name == 'gossip':
-                        n = min(5, len(self.peers))
-                        peers = random.sample(list(self.peers.values()), n)
-                        for p in peers:
-                            gossip = {
-                                "command": 'GOSSIP',
-                                "host": self.host,
-                                "port": self.peerPort,
-                                "name": 'Me',
-                                "messageID": str(uuid.uuid4())
-                            }
-                            peerSocket.sendto(json.dumps(gossip).encode(), (p.host, p.port))
-                        self.events[event.id].renew(time.time() + 60)
-                    
-                except socket.timeout as e:
+                except socket.timeout:
                     continue
-                except KeyboardInterrupt as e:
+                except KeyboardInterrupt:
                     sys.exit(0)
                 except Exception as e:
-                    print(e)
+                    if self.debug:
+                        print(e)
 
+    def handlePeerSocket(self, sock):
+        data, addr = sock.recvfrom(1024)
+        res = json.loads(data.decode('utf-8', 'ignore'))
+        command = res['command']
+        if command == 'GOSSIP':
+            self.onGossiped(int(sock.getsockname()[1]), sock, res)
+        elif command == 'GOSSIP_REPLY':
+            self.onGossipReplied(res)
+        elif command == 'CONSENSUS':
+            self.onConsensusReceived(sock, res)
+        elif command == 'CONSENSUS-REPLY':
+            self.onConsensusReplyReceived(res)
+        elif command == 'QUERY':
+            self.onQueryReceived(sock, res)
+
+    def handleClientSocket(self, sock):
+        conn, addr = sock.accept()
+        conn.setblocking(False)
+        self.client_sockets.append(conn)
+
+    def handleClientData(self, conn):
+        data = conn.recv(1024)
+        if not data:
+            self.client_sockets.remove(conn)
+        else:
+            self.handleCLI(conn, data)
+    
+    def handleEvent(self, event):
+        if event.name == 'gossip':
+            n = min(5, len(self.peers))
+            peers = random.sample(list(self.peers.values()), n)
+            for p in peers:
+                gossip = {
+                    "command": 'GOSSIP',
+                    "host": self.host,
+                    "port": self.peerPort,
+                    "name": f"Failure's peer on {self.hostname}",
+                    "messageID": str(uuid.uuid4())
+                }
+                self.peerSocket.sendto(json.dumps(gossip).encode(), (p.host, p.port))
+            self.events[event.id].renew(time.time() + 60)
+        elif event.name == 'consensus':
+            index = event.index
+            self.initiateConsensus(index)
+    
     def generatePeerKey(self, res):
         return res['host'] + ':' + str(res['port'])
 
     def isSelf(self, key):
         return key == self.host + ':' + str(self.peerPort)
-    
-    def logPeers(self):
-        print('------ Current Peers --------')
-        for k, v in self.peers.items():
-            print(k, v.expiry)
-        print('-----------------------------')
-        
-    def logGossipsReceived(self):
-        print('------ Gossip IDs Received --------')
-        for id in self.gossipsReceived:
-            print(id)
-        print('-----------------------------------')
 
     def onGossipReplied(self, res):
         key = self.generatePeerKey(res)
@@ -194,7 +205,6 @@ class Server:
     def onGossiped(self, port, peerSocket, res):
         gossipId = res['messageID']
         if gossipId not in self.gossipsReceived:
-            self.counter += 1
             self.gossipsReceived.append(gossipId)
 
             key = self.generatePeerKey(res)
@@ -204,16 +214,14 @@ class Server:
                 
                 reply = {
                     'command': 'GOSSIP_REPLY',
-                    'host': socket.gethostname(),
+                    'host': self.host,
                     'port': port,
-                    'name': 'Me reply',
-                }                     
+                    'name': 'Failure replies',
+                }
                 peerSocket.sendto(json.dumps(reply).encode(), (peer.host, peer.port))
                 
             else:
                 self.peers[key].renew()
-        else:
-            print(f'Gossip {gossipId} exists')
     
     def onConsensusReceived(self, sock, res):
         OM_level = res['OM']
@@ -223,23 +231,61 @@ class Server:
         messageID = res['messageID']
         due = res['due']
 
+        print(f"CONSENSUS received with message ID {messageID} at OM level {OM_level}")
+
         if OM_level > 0:
             sub_consensus_value = self.initiateConsensus(index, OM_level - 1, value, peers, messageID, due)
+            if self.is_lying and random.random() < self.lie_probability:
+                sub_consensus_value = 'LIE'
             reply = {
                 'command': 'CONSENSUS-REPLY',
                 'value': sub_consensus_value,
                 'reply-to': messageID
             }
+            print(f"Sending CONSENSUS-REPLY for message ID {messageID} with value {sub_consensus_value}")
             sock.sendto(json.dumps(reply).encode(), (res['host'], res['port']))
         else:
+            if self.is_lying and random.random() < self.lie_probability:
+                value = 'LIE'
             self.words[index] = value
             reply = {
                 'command': 'CONSENSUS-REPLY',
                 'value': value,
                 'reply-to': messageID
             }
+            print(f"Sending CONSENSUS-REPLY for message ID {messageID} with value {value}")
             sock.sendto(json.dumps(reply).encode(), (res['host'], res['port']))
-    
+
+    def onConsensusReplyReceived(self, res):
+        messageID = res['reply-to']
+        value = res['value']
+
+        # Store the received value
+        if messageID in self.pending_consensus:
+            self.pending_consensus[messageID].append(value)
+
+            # Check if all responses are received or timeout occurred
+            if (len(self.pending_consensus[messageID]) == len(self.peers) - 4 or
+                    time.time() - self.pending_consensus_start_time[messageID] > 30):
+                consensus_value = max(set(self.pending_consensus[messageID]), key=self.pending_consensus[messageID].count)
+                print(f"Consensus for message ID {messageID} is {consensus_value}")
+                
+                consensus_notification = {
+                'command': 'CONSENSUS-REPLY',
+                'value': consensus_value,
+                'messageID': messageID
+            }
+
+            for peer in self.peers.values():
+                self.sendUDPCommand(consensus_notification, peer.host, peer.port)
+
+                # self.words[index] = consensus_value
+
+                # Clean up the stored responses
+                del self.pending_consensus[messageID]
+                del self.pending_consensus_start_time[messageID]
+                del self.pending_consensus_peers[messageID]
+
     def initiateConsensus(self, index, OM_level=0, value=None, peers=None, messageID=None, due=None):
         if peers is None:
             peers = [peer for peer in self.peers.keys() if not self.isSelf(peer)]
@@ -249,6 +295,18 @@ class Server:
             value = self.words[index]
         if due is None:
             due = int(time.time()) + 30
+
+        # Check if the current value matches the desired value
+        if self.words[index] == value:
+            print(f"No need for consensus on index {index} as the value is already {value}")
+            return messageID
+
+        # Check if we have initiated consensus recently for this index
+        if messageID in self.pending_consensus:
+            print(f"Consensus already initiated for message ID {messageID}")
+            return messageID
+
+        print(f"Initiating consensus on index {index} with value {value} at OM level {OM_level}")
 
         command = {
             'command': 'CONSENSUS',
@@ -261,25 +319,19 @@ class Server:
         }
 
         for peer in peers:
-            peer_host, peer_port = peer.split(':')
-            self.sendUDPCommand(command, peer_host, int(peer_port))
+            if peer not in self.pending_consensus_peers[messageID]:
+                peer_host, peer_port = peer.split(':')
+                print(f"Sending CONSENSUS command to peer {peer_host}:{peer_port}")
+                self.sendUDPCommand(command, peer_host, int(peer_port))
+                self.pending_consensus_peers[messageID].add(peer)
 
-        responses = []
-        start_time = time.time()
-        while time.time() - start_time < 30:
-            try:
-                data, addr = self.peerSocket.recvfrom(1024)
-                res = json.loads(data.decode('utf-8', 'ignore'))
-                if res['reply-to'] == messageID:
-                    responses.append(res['value'])
-            except socket.timeout:
-                continue
-        
-        consensus_value = max(set(responses), key=responses.count)
-        self.words[index] = consensus_value
-        return consensus_value
+        # Track the message ID and start time
+        self.pending_consensus[messageID] = []
+        self.pending_consensus_start_time[messageID] = time.time()
+        return messageID
 
     def sendUDPCommand(self, command, host, port):
+        print(f"Sending UDP command to {host}:{port} with command {command}")
         self.peerSocket.sendto(json.dumps(command).encode(), (host, port))
         
     def handleCLI(self, conn, data):
@@ -291,13 +343,20 @@ class Server:
             conn.sendall((json.dumps(self.words, indent=2) + '\n').encode())
         elif command[0] == 'consensus' and len(command) > 1:
             index = int(command[1])
-            self.initiateConsensus(index)
-            conn.sendall((f"Consensus on index {index} completed.\n").encode())
+            print(f"CLI command: Initiating consensus on index {index}")
+            messageID = self.initiateConsensus(index)
+            print(f"Consensus initiated with message ID {messageID}")
+            conn.sendall((f"Consensus on index {index} initiated with message ID {messageID}.\n").encode())
         elif command[0] == 'lie':
             self.is_lying = True
-            conn.sendall("Node will now lie.\n".encode())
+            if len(command) > 1:
+                self.lie_probability = float(command[1])
+            else:
+                self.lie_probability = 1
+            conn.sendall(f"Node will now lie with probability {self.lie_probability}.\n".encode())
         elif command[0] == 'truth':
             self.is_lying = False
+            self.lie_probability = 0.0
             conn.sendall("Node will now tell the truth.\n".encode())
         elif command[0] == 'set' and len(command) > 2:
             index = int(command[1])
@@ -311,9 +370,24 @@ class Server:
         else:
             conn.sendall("Invalid command.\n".encode())
 
+    def onQueryReceived(self, sock, res):
+        query_reply = {
+            'command': 'QUERY-REPLY',
+            'database': self.words
+        }
+        sock.sendto(json.dumps(query_reply).encode(), (res['host'], res['port']))
+        
 def main():
-    specified_port = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    Server(specified_port).start()
+    specified_port = None
+    debug = False  # already remove
+
+    for arg in sys.argv[1:]:
+        if arg == '--debug':
+            debug = True
+        else:
+            specified_port = int(arg)
+
+    Server(specified_port, debug).start()
 
 if __name__ == "__main__":
     main()
