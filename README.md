@@ -1,6 +1,6 @@
-# comp3010a3
+# Peer-to-Peer - Distributed Consensus Sytem
 
-## Peer-to_Peer - Distributed Consensus Sytem
+## *Note: Well-known peers are down after June 14, 2024 but this is still a good example of p2p consensus system written in Python
 
 ### How to start a Peer
 
